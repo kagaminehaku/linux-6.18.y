@@ -95,6 +95,7 @@
 #include <linux/bitops.h>
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
+#include <linux/leds.h>
 #include <linux/mii.h>
 #include <linux/mutex.h>
 #include <linux/of_irq.h>
@@ -345,6 +346,14 @@
 #define RTL8365MB_LED_FUNC_MAX		0xF
 #define RTL8365MB_LED_BLINK_RATE_84MS	1
 #define RTL8365MB_LED_BLINK_RATE_MAX	5
+
+/* Per-port LED override, two bits for each port and LED */
+#define RTL8365MB_LED_FORCE_REG(_led)		(0x1B08 + (_led) * 2)
+#define   RTL8365MB_LED_FORCE_MASK(_port)	(GENMASK(1, 0) << ((_port) * 2))
+#define   RTL8365MB_LED_FORCE_NORMAL		0
+#define   RTL8365MB_LED_FORCE_OFF		2
+#define   RTL8365MB_LED_FORCE_ON		3
+#define RTL8365MB_LED_FORCE_MAX_PORT		7
 
 /* External interface port speed values - used in DIGITAL_INTERFACE_FORCE */
 #define RTL8365MB_PORT_SPEED_10M	0
@@ -855,6 +864,34 @@ struct rtl8365mb_port {
 };
 
 /**
+ * enum rtl8365mb_led_mode - how a port LED is driven
+ * @RTL8365MB_LED_MODE_DEFAULT: follows the LED function shared by all ports
+ * @RTL8365MB_LED_MODE_HW: offloaded netdev trigger, holds the shared function
+ * @RTL8365MB_LED_MODE_SW: forced on or off by the LED core
+ */
+enum rtl8365mb_led_mode {
+	RTL8365MB_LED_MODE_DEFAULT,
+	RTL8365MB_LED_MODE_HW,
+	RTL8365MB_LED_MODE_SW,
+};
+
+/**
+ * struct rtl8365mb_led - LED class device for one LED of a port
+ * @priv: pointer to parent realtek_priv data
+ * @cdev: LED class device
+ * @mode: how the LED is currently driven
+ * @port: switch port the LED belongs to
+ * @index: LED of the port (LED0, LED1 or LED2)
+ */
+struct rtl8365mb_led {
+	struct realtek_priv *priv;
+	struct led_classdev cdev;
+	enum rtl8365mb_led_mode mode;
+	int port;
+	int index;
+};
+
+/**
  * struct rtl8365mb - driver private data
  * @priv: pointer to parent realtek_priv data
  * @irq: registered IRQ or zero
@@ -865,6 +902,8 @@ struct rtl8365mb_port {
  * @pcs: PCS for the SerDes external interface
  * @sds_supported: SerDes tuning parameters match the chip option, so the
  *                 SerDes interface modes can be advertised
+ * @led_lock: protects the port LED modes and the shared LED functions
+ * @leds: registered port LEDs, indexed by port and LED
  *
  * Private data for this driver.
  */
@@ -877,6 +916,8 @@ struct rtl8365mb {
 	struct rtl8365mb_port ports[RTL8365MB_MAX_NUM_PORTS];
 	struct phylink_pcs pcs;
 	bool sds_supported;
+	struct mutex led_lock;
+	struct rtl8365mb_led *leds[RTL8365MB_MAX_NUM_PORTS][RTL8365MB_NUM_LEDS];
 };
 
 #define pcs_to_rtl8365mb(_pcs) container_of((_pcs), struct rtl8365mb, pcs)
@@ -3154,6 +3195,353 @@ static int rtl8365mb_led_setup(struct realtek_priv *priv, u32 user_ports_mask)
 				  val);
 }
 
+#if IS_ENABLED(CONFIG_LEDS_CLASS) && IS_ENABLED(CONFIG_LEDS_TRIGGERS)
+#define RTL8365MB_LED_ACT_RULES	(BIT(TRIGGER_NETDEV_TX) | BIT(TRIGGER_NETDEV_RX))
+
+/* LED functions the netdev trigger can be offloaded to (datasheet Table 16) */
+static const struct {
+	u32 func;
+	unsigned long rules;
+} rtl8365mb_led_hw_rules[] = {
+	/* Dup/Col */
+	{ 1, BIT(TRIGGER_NETDEV_FULL_DUPLEX) },
+	/* Link/Act */
+	{ 2, BIT(TRIGGER_NETDEV_LINK) | RTL8365MB_LED_ACT_RULES },
+	/* Spd1000, Spd100, Spd10 */
+	{ 3, BIT(TRIGGER_NETDEV_LINK_1000) },
+	{ 4, BIT(TRIGGER_NETDEV_LINK_100) },
+	{ 5, BIT(TRIGGER_NETDEV_LINK_10) },
+	/* Spd1000/Act, Spd100/Act, Spd10/Act */
+	{ 6, BIT(TRIGGER_NETDEV_LINK_1000) | RTL8365MB_LED_ACT_RULES },
+	{ 7, BIT(TRIGGER_NETDEV_LINK_100) | RTL8365MB_LED_ACT_RULES },
+	{ 8, BIT(TRIGGER_NETDEV_LINK_10) | RTL8365MB_LED_ACT_RULES },
+	/* Spd100 (10)/Act */
+	{ 9, BIT(TRIGGER_NETDEV_LINK_10) | BIT(TRIGGER_NETDEV_LINK_100) |
+	     RTL8365MB_LED_ACT_RULES },
+};
+
+static struct rtl8365mb_led *to_rtl8365mb_led(struct led_classdev *cdev)
+{
+	return container_of(cdev, struct rtl8365mb_led, cdev);
+}
+
+static int rtl8365mb_led_get_func(struct realtek_priv *priv, int index,
+				  u32 *func)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_read(priv->map, RTL8365MB_LED_CONFIG_REG, &val);
+	if (ret)
+		return ret;
+
+	*func = (val & RTL8365MB_LED_CONFIG_FUNC_MASK(index)) >> (index * 4);
+
+	return 0;
+}
+
+static int rtl8365mb_led_force(struct rtl8365mb_led *led, u32 force)
+{
+	return regmap_update_bits(led->priv->map,
+				  RTL8365MB_LED_FORCE_REG(led->index),
+				  RTL8365MB_LED_FORCE_MASK(led->port),
+				  force << (led->port * 2));
+}
+
+/* The function of an LED is shared by that LED on all ports, so it can only
+ * be changed while no other port has a netdev trigger offloaded to it.
+ * Must be called with led_lock held.
+ */
+static int rtl8365mb_led_func_available(struct rtl8365mb_led *led, u32 func)
+{
+	struct rtl8365mb *mb = led->priv->chip_data;
+	struct rtl8365mb_led *other;
+	u32 cur;
+	int port;
+	int ret;
+
+	ret = rtl8365mb_led_get_func(led->priv, led->index, &cur);
+	if (ret)
+		return ret;
+
+	if (cur == func)
+		return 0;
+
+	for (port = 0; port < RTL8365MB_MAX_NUM_PORTS; port++) {
+		other = mb->leds[port][led->index];
+		if (other && other != led &&
+		    other->mode == RTL8365MB_LED_MODE_HW)
+			return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int rtl8365mb_led_brightness_set(struct led_classdev *cdev,
+					enum led_brightness brightness)
+{
+	struct rtl8365mb_led *led = to_rtl8365mb_led(cdev);
+	struct rtl8365mb *mb = led->priv->chip_data;
+	int ret;
+
+	mutex_lock(&mb->led_lock);
+	ret = rtl8365mb_led_force(led, brightness ? RTL8365MB_LED_FORCE_ON :
+						    RTL8365MB_LED_FORCE_OFF);
+	if (!ret)
+		led->mode = RTL8365MB_LED_MODE_SW;
+	mutex_unlock(&mb->led_lock);
+
+	return ret;
+}
+
+static int rtl8365mb_led_rules_to_func(unsigned long rules, u32 *func)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(rtl8365mb_led_hw_rules); i++) {
+		if (rtl8365mb_led_hw_rules[i].rules == rules) {
+			*func = rtl8365mb_led_hw_rules[i].func;
+			return 0;
+		}
+	}
+
+	return -EOPNOTSUPP;
+}
+
+static int rtl8365mb_led_hw_control_is_supported(struct led_classdev *cdev,
+						 unsigned long rules)
+{
+	struct rtl8365mb_led *led = to_rtl8365mb_led(cdev);
+	struct rtl8365mb *mb = led->priv->chip_data;
+	u32 func;
+	int ret;
+
+	ret = rtl8365mb_led_rules_to_func(rules, &func);
+	if (ret)
+		return ret;
+
+	mutex_lock(&mb->led_lock);
+	ret = rtl8365mb_led_func_available(led, func);
+	mutex_unlock(&mb->led_lock);
+
+	return ret;
+}
+
+static int rtl8365mb_led_hw_control_set(struct led_classdev *cdev,
+					unsigned long rules)
+{
+	struct rtl8365mb_led *led = to_rtl8365mb_led(cdev);
+	struct realtek_priv *priv = led->priv;
+	struct rtl8365mb *mb = priv->chip_data;
+	u32 func;
+	int ret;
+
+	ret = rtl8365mb_led_rules_to_func(rules, &func);
+	if (ret)
+		return ret;
+
+	mutex_lock(&mb->led_lock);
+
+	ret = rtl8365mb_led_func_available(led, func);
+	if (ret)
+		goto out;
+
+	ret = regmap_update_bits(priv->map, RTL8365MB_LED_CONFIG_REG,
+				 RTL8365MB_LED_CONFIG_FUNC_MASK(led->index) |
+				 RTL8365MB_LED_CONFIG_SEL_MASK,
+				 func << (led->index * 4));
+	if (ret)
+		goto out;
+
+	ret = rtl8365mb_led_force(led, RTL8365MB_LED_FORCE_NORMAL);
+	if (!ret)
+		led->mode = RTL8365MB_LED_MODE_HW;
+
+out:
+	mutex_unlock(&mb->led_lock);
+
+	return ret;
+}
+
+static int rtl8365mb_led_hw_control_get(struct led_classdev *cdev,
+					unsigned long *rules)
+{
+	struct rtl8365mb_led *led = to_rtl8365mb_led(cdev);
+	u32 func;
+	int ret;
+	int i;
+
+	ret = rtl8365mb_led_get_func(led->priv, led->index, &func);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(rtl8365mb_led_hw_rules); i++) {
+		if (rtl8365mb_led_hw_rules[i].func == func) {
+			*rules = rtl8365mb_led_hw_rules[i].rules;
+			return 0;
+		}
+	}
+
+	return -EOPNOTSUPP;
+}
+
+static struct device *
+rtl8365mb_led_hw_control_get_device(struct led_classdev *cdev)
+{
+	struct rtl8365mb_led *led = to_rtl8365mb_led(cdev);
+	struct dsa_port *dp = dsa_to_port(&led->priv->ds, led->port);
+
+	if (dp && dp->user)
+		return &dp->user->dev;
+
+	return NULL;
+}
+
+static int rtl8365mb_led_register(struct realtek_priv *priv,
+				  struct dsa_port *dp, struct device_node *np)
+{
+	struct rtl8365mb *mb = priv->chip_data;
+	struct led_init_data init_data = {};
+	struct rtl8365mb_led *led;
+	u32 index;
+	int ret;
+
+	if (of_property_read_u32(np, "reg", &index) ||
+	    index >= RTL8365MB_NUM_LEDS)
+		return -EINVAL;
+
+	led = kzalloc(sizeof(*led), GFP_KERNEL);
+	if (!led)
+		return -ENOMEM;
+
+	led->priv = priv;
+	led->port = dp->index;
+	led->index = index;
+
+	/* The LED needs its pin enabled for the port to light up at all */
+	ret = regmap_update_bits(priv->map, RTL8365MB_LED_PORT_EN_REG(index),
+				 BIT(dp->index) << ((index % 2) * 8),
+				 BIT(dp->index) << ((index % 2) * 8));
+	if (ret)
+		goto err_free;
+
+	switch (led_init_default_state_get(of_fwnode_handle(np))) {
+	case LEDS_DEFSTATE_KEEP:
+		led->mode = RTL8365MB_LED_MODE_DEFAULT;
+		break;
+	case LEDS_DEFSTATE_ON:
+		led->cdev.brightness = 1;
+		led->mode = RTL8365MB_LED_MODE_SW;
+		ret = rtl8365mb_led_force(led, RTL8365MB_LED_FORCE_ON);
+		break;
+	default:
+		led->mode = RTL8365MB_LED_MODE_SW;
+		ret = rtl8365mb_led_force(led, RTL8365MB_LED_FORCE_OFF);
+		break;
+	}
+	if (ret)
+		goto err_free;
+
+	led->cdev.max_brightness = 1;
+	led->cdev.flags = LED_RETAIN_AT_SHUTDOWN;
+	led->cdev.brightness_set_blocking = rtl8365mb_led_brightness_set;
+	led->cdev.hw_control_is_supported = rtl8365mb_led_hw_control_is_supported;
+	led->cdev.hw_control_set = rtl8365mb_led_hw_control_set;
+	led->cdev.hw_control_get = rtl8365mb_led_hw_control_get;
+	led->cdev.hw_control_get_device = rtl8365mb_led_hw_control_get_device;
+	led->cdev.hw_control_trigger = "netdev";
+
+	init_data.fwnode = of_fwnode_handle(np);
+	init_data.devname_mandatory = true;
+	init_data.devicename = dp->name ?
+		kasprintf(GFP_KERNEL, "rtl8365mb-%s", dp->name) :
+		kasprintf(GFP_KERNEL, "rtl8365mb-port%d", dp->index);
+	if (!init_data.devicename) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
+	ret = led_classdev_register_ext(priv->dev, &led->cdev, &init_data);
+	kfree(init_data.devicename);
+	if (ret)
+		goto err_free;
+
+	mb->leds[dp->index][index] = led;
+
+	return 0;
+
+err_free:
+	kfree(led);
+
+	return ret;
+}
+
+/* Register the LEDs described under the "leds" node of each user port, so
+ * that their function can be picked with the netdev trigger and is offloaded
+ * to the switch whenever it matches one of the hardware LED functions.
+ */
+static void rtl8365mb_leds_setup(struct realtek_priv *priv)
+{
+	struct dsa_switch *ds = &priv->ds;
+	struct device_node *leds_np;
+	struct device_node *np;
+	struct dsa_port *dp;
+	int ret;
+
+	dsa_switch_for_each_user_port(dp, ds) {
+		leds_np = of_get_child_by_name(dp->dn, "leds");
+		if (!leds_np)
+			continue;
+
+		/* The override registers only cover the first eight ports */
+		if (dp->index > RTL8365MB_LED_FORCE_MAX_PORT) {
+			of_node_put(leds_np);
+			continue;
+		}
+
+		for_each_available_child_of_node(leds_np, np) {
+			ret = rtl8365mb_led_register(priv, dp, np);
+			if (ret)
+				dev_warn(priv->dev,
+					 "failed to register LED %pOF: %pe\n",
+					 np, ERR_PTR(ret));
+		}
+
+		of_node_put(leds_np);
+	}
+}
+
+static void rtl8365mb_leds_teardown(struct realtek_priv *priv)
+{
+	struct rtl8365mb *mb = priv->chip_data;
+	struct rtl8365mb_led *led;
+	int port;
+	int i;
+
+	for (port = 0; port < RTL8365MB_MAX_NUM_PORTS; port++) {
+		for (i = 0; i < RTL8365MB_NUM_LEDS; i++) {
+			led = mb->leds[port][i];
+			if (!led)
+				continue;
+
+			led_classdev_unregister(&led->cdev);
+			/* Hand the LED back to the shared hardware function */
+			rtl8365mb_led_force(led, RTL8365MB_LED_FORCE_NORMAL);
+			mb->leds[port][i] = NULL;
+			kfree(led);
+		}
+	}
+}
+#else
+static void rtl8365mb_leds_setup(struct realtek_priv *priv)
+{
+}
+
+static void rtl8365mb_leds_teardown(struct realtek_priv *priv)
+{
+}
+#endif
+
 static int rtl8365mb_setup(struct dsa_switch *ds)
 {
 	struct realtek_priv *priv = ds->priv;
@@ -3295,6 +3683,8 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 		dev_warn(priv->dev, "failed to configure port LEDs: %pe\n",
 			 ERR_PTR(ret));
 
+	rtl8365mb_leds_setup(priv);
+
 	/* Trap to the same CPU port that user ports default to */
 	dp = rtl8365mb_preferred_default_local_cpu_port(ds);
 	if (dp)
@@ -3372,6 +3762,7 @@ static void rtl8365mb_teardown(struct dsa_switch *ds)
 {
 	struct realtek_priv *priv = ds->priv;
 
+	rtl8365mb_leds_teardown(priv);
 	rtl8365mb_stats_teardown(priv);
 	rtl8365mb_irq_teardown(priv);
 }
@@ -3438,6 +3829,7 @@ static int rtl8365mb_detect(struct realtek_priv *priv)
 
 	priv->num_ports = RTL8365MB_MAX_NUM_PORTS;
 	mb->priv = priv;
+	mutex_init(&mb->led_lock);
 	mb->cpu.trap_port = RTL8365MB_MAX_NUM_PORTS;
 	mb->cpu.insert = RTL8365MB_CPU_INSERT_TO_ALL;
 	mb->cpu.position = RTL8365MB_CPU_POS_AFTER_SA;
