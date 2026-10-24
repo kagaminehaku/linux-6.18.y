@@ -98,6 +98,7 @@
 #include <linux/mii.h>
 #include <linux/mutex.h>
 #include <linux/of_irq.h>
+#include <linux/of_net.h>
 #include <linux/regmap.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
@@ -1443,6 +1444,29 @@ static bool rtl8365mb_interface_is_serdes(phy_interface_t interface)
 {
 	return interface == PHY_INTERFACE_MODE_SGMII ||
 	       interface == PHY_INTERFACE_MODE_2500BASEX;
+}
+
+/* With more than one CPU port, DSA would assign all user ports to the lowest
+ * numbered one, which on the RTL8367S is the SerDes port 6. Prefer a CPU port
+ * on a parallel interface (RGMII, port 7) instead, so that adding the SerDes
+ * CPU port does not move all traffic onto it; ports can still be moved to
+ * another conduit later.
+ */
+static struct dsa_port *
+rtl8365mb_preferred_default_local_cpu_port(struct dsa_switch *ds)
+{
+	phy_interface_t interface;
+	struct dsa_port *dp;
+
+	dsa_switch_for_each_cpu_port(dp, ds) {
+		if (of_get_phy_mode(dp->dn, &interface))
+			continue;
+
+		if (!rtl8365mb_interface_is_serdes(interface))
+			return dp;
+	}
+
+	return NULL;
 }
 
 static unsigned int rtl8365mb_pcs_inband_caps(struct phylink_pcs *pcs,
@@ -3215,9 +3239,11 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 		if (!dsa_port_is_user(dp))
 			continue;
 
-		/* Forward only to the CPU */
+		/* Forward only to the CPU port this port is assigned to, so
+		 * that flooded frames do not reach the host once per conduit
+		 */
 		ret = rtl8365mb_port_set_isolation(priv, dp->index,
-						   upports_mask);
+						   BIT(dp->cpu_dp->index));
 		if (ret)
 			goto out_teardown_irq;
 
@@ -3231,6 +3257,11 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 	if (ret)
 		dev_warn(priv->dev, "failed to configure port LEDs: %pe\n",
 			 ERR_PTR(ret));
+
+	/* Trap to the same CPU port that user ports default to */
+	dp = rtl8365mb_preferred_default_local_cpu_port(ds);
+	if (dp)
+		cpu->trap_port = dp->index;
 
 	/* Configure CPU tagging */
 	/* If we support cascade switches, it should also include the upstream
@@ -3389,6 +3420,8 @@ static const struct phylink_mac_ops rtl8365mb_phylink_mac_ops = {
 static const struct dsa_switch_ops rtl8365mb_switch_ops = {
 	.get_tag_protocol = rtl8365mb_get_tag_protocol,
 	.change_tag_protocol = rtl8365mb_change_tag_protocol,
+	.preferred_default_local_cpu_port =
+		rtl8365mb_preferred_default_local_cpu_port,
 	.setup = rtl8365mb_setup,
 	.teardown = rtl8365mb_teardown,
 	.phylink_get_caps = rtl8365mb_phylink_get_caps,
