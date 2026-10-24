@@ -324,6 +324,27 @@
 #define RTL8365MB_MISC_CFG0_REG			0x130C
 #define   RTL8365MB_MISC_CFG0_DW8051_EN_MASK	0x0020
 
+/* Port LED control registers */
+#define RTL8365MB_LED_SYS_CONFIG_REG			0x1B00
+#define   RTL8365MB_LED_SYS_CONFIG_LEDOP_SERIAL_MASK	0x0001
+#define RTL8365MB_LED_MODE_REG				0x1B02
+#define   RTL8365MB_LED_MODE_BLINK_RATE_MASK		GENMASK(3, 1)
+#define RTL8365MB_LED_CONFIG_REG			0x1B03
+#define   RTL8365MB_LED_CONFIG_FUNC_MASK(_led)		(GENMASK(3, 0) << ((_led) * 4))
+#define   RTL8365MB_LED_CONFIG_GROUP_MODE_MASK		GENMASK(13, 12)
+#define   RTL8365MB_LED_CONFIG_SEL_MASK			BIT(14)
+#define RTL8365MB_LED_PORT_EN_REG(_led)			(0x1B24 + ((_led) / 2))
+#define   RTL8365MB_LED_PORT_EN_MASK(_led)		(GENMASK(7, 0) << (((_led) % 2) * 8))
+#define RTL8365MB_LED_SERIAL_CTRL_REG			0x1B26
+#define   RTL8365MB_LED_SERIAL_CTRL_CLK_EN_MASK		0x0001
+#define   RTL8365MB_LED_SERIAL_CTRL_DATA_EN_MASK	0x0002
+
+#define RTL8365MB_NUM_LEDS		3
+#define RTL8365MB_LED_FUNC_OFF		0
+#define RTL8365MB_LED_FUNC_MAX		0xF
+#define RTL8365MB_LED_BLINK_RATE_84MS	1
+#define RTL8365MB_LED_BLINK_RATE_MAX	5
+
 /* External interface port speed values - used in DIGITAL_INTERFACE_FORCE */
 #define RTL8365MB_PORT_SPEED_10M	0
 #define RTL8365MB_PORT_SPEED_100M	1
@@ -2994,6 +3015,84 @@ static int rtl8365mb_reset_chip(struct realtek_priv *priv)
 					20000, 1e6);
 }
 
+/* Configure the port LEDs from the "realtek,led-functions" property: one
+ * function code per LED (0 = off, 2 = Link/Act, 3 = Spd1000, ...), driven in
+ * parallel mode on all user ports. Without the property the LEDs keep their
+ * reset configuration, which on some boards leaves them in serial mode with a
+ * 43 ms blink rate, so activity LEDs look steadily lit.
+ */
+static int rtl8365mb_led_setup(struct realtek_priv *priv, u32 user_ports_mask)
+{
+	struct device_node *dn = priv->dev->of_node;
+	u32 funcs[RTL8365MB_NUM_LEDS] = { RTL8365MB_LED_FUNC_OFF };
+	u32 blink_rate = RTL8365MB_LED_BLINK_RATE_84MS;
+	u32 mask = 0;
+	u32 val = 0;
+	int count;
+	int ret;
+	int i;
+
+	count = of_property_count_u32_elems(dn, "realtek,led-functions");
+	if (count <= 0)
+		return 0;
+	if (count > RTL8365MB_NUM_LEDS)
+		return -EINVAL;
+
+	ret = of_property_read_u32_array(dn, "realtek,led-functions", funcs,
+					 count);
+	if (ret)
+		return ret;
+
+	of_property_read_u32(dn, "realtek,led-blink-rate", &blink_rate);
+	if (blink_rate > RTL8365MB_LED_BLINK_RATE_MAX)
+		return -EINVAL;
+
+	for (i = 0; i < RTL8365MB_NUM_LEDS; i++)
+		if (funcs[i] > RTL8365MB_LED_FUNC_MAX)
+			return -EINVAL;
+
+	/* Parallel mode: one pin per port and LED, no serial clock or data */
+	ret = regmap_update_bits(priv->map, RTL8365MB_LED_SYS_CONFIG_REG,
+				 RTL8365MB_LED_SYS_CONFIG_LEDOP_SERIAL_MASK, 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map, RTL8365MB_LED_SERIAL_CTRL_REG,
+				 RTL8365MB_LED_SERIAL_CTRL_CLK_EN_MASK |
+				 RTL8365MB_LED_SERIAL_CTRL_DATA_EN_MASK, 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map, RTL8365MB_LED_MODE_REG,
+				 RTL8365MB_LED_MODE_BLINK_RATE_MASK,
+				 FIELD_PREP(RTL8365MB_LED_MODE_BLINK_RATE_MASK,
+					    blink_rate));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < RTL8365MB_NUM_LEDS; i++) {
+		u32 ports = funcs[i] == RTL8365MB_LED_FUNC_OFF ? 0 :
+			    user_ports_mask & GENMASK(7, 0);
+
+		ret = regmap_update_bits(priv->map, RTL8365MB_LED_PORT_EN_REG(i),
+					 RTL8365MB_LED_PORT_EN_MASK(i),
+					 ports << ((i % 2) * 8));
+		if (ret)
+			return ret;
+
+		mask |= RTL8365MB_LED_CONFIG_FUNC_MASK(i);
+		val |= funcs[i] << (i * 4);
+	}
+
+	/* Use the per-LED functions above instead of the group mode table */
+	mask |= RTL8365MB_LED_CONFIG_GROUP_MODE_MASK |
+		RTL8365MB_LED_CONFIG_SEL_MASK;
+	val |= RTL8365MB_LED_CONFIG_SEL_MASK;
+
+	return regmap_update_bits(priv->map, RTL8365MB_LED_CONFIG_REG, mask,
+				  val);
+}
+
 static int rtl8365mb_setup(struct dsa_switch *ds)
 {
 	struct realtek_priv *priv = ds->priv;
@@ -3127,6 +3226,11 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 		 */
 		downports_mask |= BIT(dp->index);
 	}
+
+	ret = rtl8365mb_led_setup(priv, downports_mask);
+	if (ret)
+		dev_warn(priv->dev, "failed to configure port LEDs: %pe\n",
+			 ERR_PTR(ret));
 
 	/* Configure CPU tagging */
 	/* If we support cascade switches, it should also include the upstream

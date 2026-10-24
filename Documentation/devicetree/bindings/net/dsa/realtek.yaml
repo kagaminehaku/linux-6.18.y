@@ -69,6 +69,28 @@ properties:
       this will disable them so they are not turned on
       and wasting power.
 
+  realtek,led-functions:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 3
+    items:
+      maximum: 15
+    description: |
+      RTL8365MB family only. Function of port LED0, LED1 and LED2, driven in
+      parallel mode on all user ports: 0 off, 1 duplex/collision, 2 link/act,
+      3 1000M, 4 100M, 5 10M, 6 1000M/act, 7 100M/act, 8 10M/act,
+      9 100M(10M)/act, 10 fiber, 11 fault, 12 link/rx, 13 link/tx, 14 master,
+      15 act. LEDs not listed are turned off. Without this property the LEDs
+      keep their reset configuration.
+
+  realtek,led-blink-rate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1, 2, 3, 4, 5]
+    default: 1
+    description: |
+      RTL8365MB family only, used with realtek,led-functions. LED blink rate:
+      0 43 ms, 1 84 ms, 2 120 ms, 3 170 ms, 4 340 ms, 5 670 ms.
+
   interrupt-controller:
     type: object
     additionalProperties: false
