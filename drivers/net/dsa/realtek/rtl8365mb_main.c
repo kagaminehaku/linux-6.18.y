@@ -3108,10 +3108,11 @@ static int rtl8365mb_led_setup(struct realtek_priv *priv, u32 user_ports_mask)
 		val |= funcs[i] << (i * 4);
 	}
 
-	/* Use the per-LED functions above instead of the group mode table */
+	/* Use the per-LED functions above instead of the group mode table,
+	 * which the switch follows while the config select bit is set
+	 */
 	mask |= RTL8365MB_LED_CONFIG_GROUP_MODE_MASK |
 		RTL8365MB_LED_CONFIG_SEL_MASK;
-	val |= RTL8365MB_LED_CONFIG_SEL_MASK;
 
 	return regmap_update_bits(priv->map, RTL8365MB_LED_CONFIG_REG, mask,
 				  val);
