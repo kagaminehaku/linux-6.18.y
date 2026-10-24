@@ -2294,6 +2294,42 @@ static int rtl8365mb_port_remove_isolation(struct realtek_priv *priv, int port,
 				  mask, 0);
 }
 
+/* A user port only forwards to the CPU port it is assigned to (see
+ * rtl8365mb_setup()), so moving it to another conduit means swapping that
+ * CPU port in its isolation mask. Bridged ports are made to leave the bridge
+ * by DSA beforehand, so the user port bits do not need to be touched.
+ */
+static int rtl8365mb_port_change_conduit(struct dsa_switch *ds, int port,
+					 struct net_device *conduit,
+					 struct netlink_ext_ack *extack)
+{
+	struct dsa_port *old_cpu_dp = dsa_to_port(ds, port)->cpu_dp;
+	struct realtek_priv *priv = ds->priv;
+	struct dsa_port *new_cpu_dp;
+	int ret;
+
+	if (netif_is_lag_master(conduit)) {
+		NL_SET_ERR_MSG_MOD(extack, "LAG DSA conduit not supported");
+		return -EOPNOTSUPP;
+	}
+
+	new_cpu_dp = conduit->dsa_ptr;
+	if (new_cpu_dp == old_cpu_dp)
+		return 0;
+
+	ret = rtl8365mb_port_add_isolation(priv, port, BIT(new_cpu_dp->index));
+	if (ret)
+		return ret;
+
+	ret = rtl8365mb_port_remove_isolation(priv, port,
+					      BIT(old_cpu_dp->index));
+	if (ret)
+		rtl8365mb_port_remove_isolation(priv, port,
+						BIT(new_cpu_dp->index));
+
+	return ret;
+}
+
 static int rtl8365mb_mib_counter_read(struct realtek_priv *priv, int port,
 				      u32 offset, u32 length, u64 *mibvalue)
 {
@@ -3448,6 +3484,7 @@ static const struct dsa_switch_ops rtl8365mb_switch_ops = {
 	.get_eth_ctrl_stats = rtl8365mb_get_ctrl_stats,
 	.get_stats64 = rtl8365mb_get_stats64,
 	.port_change_mtu = rtl8365mb_port_change_mtu,
+	.port_change_conduit = rtl8365mb_port_change_conduit,
 	.port_max_mtu = rtl8365mb_port_max_mtu,
 	.port_hsr_join = dsa_port_simple_hsr_join,
 	.port_hsr_leave = dsa_port_simple_hsr_leave,
