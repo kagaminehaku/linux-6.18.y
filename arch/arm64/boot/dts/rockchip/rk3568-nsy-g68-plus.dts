@@ -269,6 +269,12 @@
 		#clock-cells = <0>;
 	};
 
+	/* DesignWare XPCS between the GMACs and the SGMII combo PHYs */
+	xpcs: syscon@fda00000 {
+		compatible = "rockchip,rk3568-xpcs", "syscon";
+		reg = <0x0 0xfda00000 0x0 0x200000>;
+	};
+
 	adc_keys: adc-keys {
 		compatible = "adc-keys";
 		io-channels = <&saradc 0>;
@@ -756,6 +762,19 @@
 							label = "wan";
 							phy-handle = <&phy4>;
 					};
+
+					/* SerDes to gmac1 through combphy1 */
+					port@6 {
+							reg = <6>;
+							ethernet = <&gmac1>;
+							phy-mode = "sgmii";
+
+							fixed-link {
+									speed = <1000>;
+									full-duplex;
+							};
+					};
+
 					port@7 {
 							reg = <7>;
 							ethernet = <&gmac0>;
@@ -838,6 +857,17 @@
 	assigned-clock-parents = <&gmac1_xpcsclk>;
 	status = "okay";
 	phy-mode = "sgmii";
+	clocks = <&cru SCLK_GMAC1>, <&cru SCLK_GMAC1_RX_TX>,
+		 <&cru SCLK_GMAC1_RX_TX>, <&cru CLK_MAC1_REFOUT>,
+		 <&cru ACLK_GMAC1>, <&cru PCLK_GMAC1>,
+		 <&cru SCLK_GMAC1_RX_TX>, <&cru CLK_GMAC1_PTP_REF>,
+		 <&cru PCLK_XPCS>, <&cru CLK_XPCS_EEE>;
+	clock-names = "stmmaceth", "mac_clk_rx",
+		      "mac_clk_tx", "clk_mac_refout",
+		      "aclk_mac", "pclk_mac",
+		      "clk_mac_speed", "ptp_ref",
+		      "pclk_xpcs", "clk_xpcs_eee";
+	rockchip,xpcs = <&xpcs>;
 	rockchip,pipegrf = <&pipegrf>;
 	//snps,reset-gpio = <&gpio2 RK_PC2 GPIO_ACTIVE_LOW>;
 	//snps,reset-active-low;
