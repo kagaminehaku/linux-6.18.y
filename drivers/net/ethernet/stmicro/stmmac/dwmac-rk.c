@@ -15,6 +15,7 @@
 #include <linux/of_net.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/delay.h>
@@ -47,6 +48,7 @@ struct rk_gmac_ops {
 	void (*set_to_rgmii)(struct rk_priv_data *bsp_priv,
 			     int tx_delay, int rx_delay);
 	void (*set_to_rmii)(struct rk_priv_data *bsp_priv);
+	void (*set_to_sgmii)(struct rk_priv_data *bsp_priv);
 	int (*set_speed)(struct rk_priv_data *bsp_priv,
 			 phy_interface_t interface, int speed);
 	void (*integrated_phy_powerup)(struct rk_priv_data *bsp_priv);
@@ -74,6 +76,10 @@ static const char * const rk_clocks[] = {
 
 static const char * const rk_rmii_clocks[] = {
 	"mac_clk_rx", "clk_mac_ref", "clk_mac_refout",
+};
+
+static const char * const rk_sgmii_clocks[] = {
+	"pclk_xpcs", "clk_xpcs_eee",
 };
 
 enum rk_clocks_index {
@@ -111,6 +117,12 @@ struct rk_priv_data {
 	struct regmap *grf;
 	struct regmap *php_grf;
 
+	/* SGMII: on-chip DesignWare XPCS, PIPE GRF and the combo PHY SerDes */
+	struct regmap *xpcs;
+	struct regmap *pipe_grf;
+	struct phy *serdes;
+	bool xpcs_inband_an;
+
 	u16 gmac_grf_reg;
 	u16 gmac_phy_intf_sel_mask;
 	u16 gmac_rmii_mode_mask;
@@ -136,7 +148,13 @@ static int rk_gmac_rgmii_clk_div(int speed)
 
 static int rk_get_phy_intf_sel(phy_interface_t interface)
 {
-	int ret = stmmac_get_phy_intf_sel(interface);
+	int ret;
+
+	/* SGMII goes through the XPCS, which the MAC drives over GMII */
+	if (interface == PHY_INTERFACE_MODE_SGMII)
+		return PHY_INTF_SEL_GMII_MII;
+
+	ret = stmmac_get_phy_intf_sel(interface);
 
 	/* Only RGMII and RMII are supported */
 	if (ret != PHY_INTF_SEL_RGMII && ret != PHY_INTF_SEL_RMII)
@@ -803,10 +821,122 @@ static const struct rk_gmac_ops rk3528_ops = {
 	},
 };
 
+/* RK3568 on-chip DesignWare XPCS used for SGMII, accessed over APB with a
+ * 4-byte stride. Register offsets are clause 45 MMD addresses: SR_MII of MII
+ * lane 0 at 0x1f0000, lanes 1..3 at 0x1a0000 + (lane - 1) * 0x10000.
+ */
+#define RK_XPCS_APB_INCREMENT		4
+#define RK_XPCS_APB_MASK		GENMASK(20, 0)
+#define RK_XPCS_SR_MII(_lane)		\
+	((_lane) ? 0x1a0000 + ((_lane) - 1) * 0x10000 : 0x1f0000)
+#define RK_XPCS_VR_MII_DIG_CTRL1	0x8000
+#define   RK_XPCS_MAC_AUTO_SW		BIT(9)
+#define RK_XPCS_VR_MII_AN_CTRL		0x8001
+#define   RK_XPCS_PCS_MODE_SGMII	(0x2 << 1)
+#define   RK_XPCS_MII_AN_INTR_EN	BIT(0)
+#define RK_XPCS_VR_MII_AN_INTR_STS	0x8002
+#define RK_XPCS_VR_MII_LINK_TIMER_CTRL	0x800a
+#define RK_XPCS_RESET_POLL_US		50000
+#define RK_XPCS_RESET_TIMEOUT_US	600000
+
+static int rk_xpcs_read(struct rk_priv_data *bsp_priv, u32 reg, u32 *val)
+{
+	return regmap_read(bsp_priv->xpcs,
+			   (reg * RK_XPCS_APB_INCREMENT) & RK_XPCS_APB_MASK, val);
+}
+
+static int rk_xpcs_write(struct rk_priv_data *bsp_priv, u32 reg, u16 val)
+{
+	return regmap_write(bsp_priv->xpcs,
+			    (reg * RK_XPCS_APB_INCREMENT) & RK_XPCS_APB_MASK, val);
+}
+
+static int rk_xpcs_setup_sgmii(struct rk_priv_data *bsp_priv)
+{
+	u32 lane = bsp_priv->id;
+	u32 val;
+	int ret;
+
+	ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(lane) + MDIO_CTRL1,
+			    MDIO_CTRL1_RESET);
+	if (ret)
+		return ret;
+
+	ret = regmap_read_poll_timeout(bsp_priv->xpcs,
+				       ((RK_XPCS_SR_MII(lane) + MDIO_CTRL1) *
+					RK_XPCS_APB_INCREMENT) & RK_XPCS_APB_MASK,
+				       val, !(val & MDIO_CTRL1_RESET),
+				       RK_XPCS_RESET_POLL_US,
+				       RK_XPCS_RESET_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(0) +
+			    RK_XPCS_VR_MII_AN_INTR_STS, 0);
+	if (ret)
+		return ret;
+
+	ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(0) +
+			    RK_XPCS_VR_MII_LINK_TIMER_CTRL, 1);
+	if (ret)
+		return ret;
+
+	ret = rk_xpcs_read(bsp_priv, RK_XPCS_SR_MII(lane) +
+			   RK_XPCS_VR_MII_DIG_CTRL1, &val);
+	if (ret)
+		return ret;
+
+	if (bsp_priv->xpcs_inband_an) {
+		/* Vendor setup: SGMII in-band autonegotiation, with the MAC
+		 * speed following the negotiated result.
+		 */
+		ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(0) +
+				    RK_XPCS_VR_MII_AN_CTRL,
+				    RK_XPCS_PCS_MODE_SGMII |
+				    RK_XPCS_MII_AN_INTR_EN);
+		if (ret)
+			return ret;
+
+		ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(lane) +
+				    RK_XPCS_VR_MII_DIG_CTRL1,
+				    val | RK_XPCS_MAC_AUTO_SW);
+		if (ret)
+			return ret;
+
+		return rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(lane) + MII_BMCR,
+				     BMCR_ANENABLE | BMCR_ANRESTART |
+				     BMCR_FULLDPLX | BMCR_SPEED1000);
+	}
+
+	/* Forced 1000/full without in-band autonegotiation, for link partners
+	 * such as the rtl8365mb SerDes that keep it disabled.
+	 */
+	ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(0) + RK_XPCS_VR_MII_AN_CTRL,
+			    RK_XPCS_PCS_MODE_SGMII);
+	if (ret)
+		return ret;
+
+	ret = rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(lane) +
+			    RK_XPCS_VR_MII_DIG_CTRL1, val & ~RK_XPCS_MAC_AUTO_SW);
+	if (ret)
+		return ret;
+
+	return rk_xpcs_write(bsp_priv, RK_XPCS_SR_MII(lane) + MII_BMCR,
+			     BMCR_FULLDPLX | BMCR_SPEED1000);
+}
+
 #define RK3568_GRF_GMAC0_CON0		0x0380
 #define RK3568_GRF_GMAC0_CON1		0x0384
 #define RK3568_GRF_GMAC1_CON0		0x0388
 #define RK3568_GRF_GMAC1_CON1		0x038c
+
+/* RK3568_GRF_GMAC0_CON1 && RK3568_GRF_GMAC1_CON1: MAC drives the XPCS */
+#define RK3568_GMAC_GMII_MODE			GRF_BIT(7)
+
+/* PIPE GRF: which GMAC the XPCS serves in SGMII mode (0: gmac0, 1: gmac1) */
+#define RK3568_PIPE_GRF_XPCS_CON0		0x0040
+#define RK3568_PIPE_GRF_XPCS_SGMII_MAC_SEL	GRF_BIT(1)
+#define RK3568_PIPE_GRF_XPCS_SGMII_MAC_SEL_CLR	GRF_CLR_BIT(1)
 
 /* RK3568_GRF_GMAC0_CON1 && RK3568_GRF_GMAC1_CON1 */
 #define RK3568_GMAC_FLOW_CTRL			GRF_BIT(3)
@@ -855,9 +985,32 @@ static void rk3568_set_to_rgmii(struct rk_priv_data *bsp_priv,
 		     RK3568_GMAC_TXCLK_DLY_ENABLE);
 }
 
+static void rk3568_set_to_sgmii(struct rk_priv_data *bsp_priv)
+{
+	u32 con1;
+	int ret;
+
+	con1 = (bsp_priv->id == 1) ? RK3568_GRF_GMAC1_CON1 :
+				     RK3568_GRF_GMAC0_CON1;
+
+	regmap_write(bsp_priv->grf, con1, RK3568_GMAC_GMII_MODE);
+
+	if (bsp_priv->pipe_grf)
+		regmap_write(bsp_priv->pipe_grf, RK3568_PIPE_GRF_XPCS_CON0,
+			     (bsp_priv->id == 1) ?
+			     RK3568_PIPE_GRF_XPCS_SGMII_MAC_SEL :
+			     RK3568_PIPE_GRF_XPCS_SGMII_MAC_SEL_CLR);
+
+	ret = rk_xpcs_setup_sgmii(bsp_priv);
+	if (ret)
+		dev_err(bsp_priv->dev, "failed to set up XPCS for SGMII: %pe\n",
+			ERR_PTR(ret));
+}
+
 static const struct rk_gmac_ops rk3568_ops = {
 	.init = rk3568_init,
 	.set_to_rgmii = rk3568_set_to_rgmii,
+	.set_to_sgmii = rk3568_set_to_sgmii,
 	.set_speed = rk_set_clk_mac_speed,
 
 	.gmac_phy_intf_sel_mask = GENMASK_U16(6, 4),
@@ -1114,6 +1267,8 @@ static int rk_gmac_clk_init(struct plat_stmmacenet_data *plat)
 	bsp_priv->num_clks = ARRAY_SIZE(rk_clocks);
 	if (phy_iface == PHY_INTERFACE_MODE_RMII)
 		bsp_priv->num_clks += ARRAY_SIZE(rk_rmii_clocks);
+	else if (phy_iface == PHY_INTERFACE_MODE_SGMII)
+		bsp_priv->num_clks += ARRAY_SIZE(rk_sgmii_clocks);
 
 	bsp_priv->clks = devm_kcalloc(dev, bsp_priv->num_clks,
 				      sizeof(*bsp_priv->clks), GFP_KERNEL);
@@ -1126,6 +1281,9 @@ static int rk_gmac_clk_init(struct plat_stmmacenet_data *plat)
 	if (phy_iface == PHY_INTERFACE_MODE_RMII) {
 		for (j = 0; j < ARRAY_SIZE(rk_rmii_clocks); j++)
 			bsp_priv->clks[i++].id = rk_rmii_clocks[j];
+	} else if (phy_iface == PHY_INTERFACE_MODE_SGMII) {
+		for (j = 0; j < ARRAY_SIZE(rk_sgmii_clocks); j++)
+			bsp_priv->clks[i++].id = rk_sgmii_clocks[j];
 	}
 
 	ret = devm_clk_bulk_get_optional(dev, bsp_priv->num_clks,
@@ -1306,6 +1464,43 @@ static struct rk_priv_data *rk_gmac_setup(struct platform_device *pdev,
 		}
 	}
 
+	if (bsp_priv->phy_iface == PHY_INTERFACE_MODE_SGMII) {
+		bsp_priv->xpcs = syscon_regmap_lookup_by_phandle(dev->of_node,
+								 "rockchip,xpcs");
+		if (IS_ERR(bsp_priv->xpcs)) {
+			dev_err_probe(dev, PTR_ERR(bsp_priv->xpcs),
+				      "failed to lookup rockchip,xpcs\n");
+			return ERR_CAST(bsp_priv->xpcs);
+		}
+
+		bsp_priv->pipe_grf =
+			syscon_regmap_lookup_by_phandle_optional(dev->of_node,
+								 "rockchip,pipegrf");
+		if (IS_ERR(bsp_priv->pipe_grf)) {
+			dev_warn(dev, "failed to lookup rockchip,pipegrf: %pe\n",
+				 bsp_priv->pipe_grf);
+			bsp_priv->pipe_grf = NULL;
+		}
+
+		bsp_priv->xpcs_inband_an =
+			of_property_read_bool(dev->of_node,
+					      "rockchip,xpcs-inband-an");
+
+		/* The combo PHY lane carries the SGMII SerDes */
+		bsp_priv->serdes = devm_of_phy_get(dev, dev->of_node, NULL);
+		if (IS_ERR(bsp_priv->serdes)) {
+			dev_err_probe(dev, PTR_ERR(bsp_priv->serdes),
+				      "failed to get SGMII SerDes PHY\n");
+			return ERR_CAST(bsp_priv->serdes);
+		}
+
+		ret = phy_init(bsp_priv->serdes);
+		if (ret) {
+			dev_err_probe(dev, ret, "failed to init SGMII SerDes PHY\n");
+			return ERR_PTR(ret);
+		}
+	}
+
 	if (plat->phy_node) {
 		bsp_priv->integrated_phy = of_property_read_bool(plat->phy_node,
 								 "phy-is-integrated");
@@ -1362,6 +1557,10 @@ static int rk_gmac_check_ops(struct rk_priv_data *bsp_priv)
 		break;
 	case PHY_INTERFACE_MODE_RMII:
 		if (!bsp_priv->supports_rmii)
+			return -EINVAL;
+		break;
+	case PHY_INTERFACE_MODE_SGMII:
+		if (!bsp_priv->ops->set_to_sgmii || !bsp_priv->xpcs)
 			return -EINVAL;
 		break;
 	default:
@@ -1450,6 +1649,11 @@ static int rk_gmac_powerup(struct rk_priv_data *bsp_priv)
 		if (bsp_priv->ops->set_to_rmii)
 			bsp_priv->ops->set_to_rmii(bsp_priv);
 		break;
+	case PHY_INTERFACE_MODE_SGMII:
+		dev_info(dev, "init for SGMII (XPCS %s)\n",
+			 bsp_priv->xpcs_inband_an ? "in-band AN" : "forced 1000/full");
+		bsp_priv->ops->set_to_sgmii(bsp_priv);
+		break;
 	default:
 		dev_err(dev, "NO interface defined!\n");
 	}
@@ -1489,6 +1693,9 @@ static void rk_get_interfaces(struct stmmac_priv *priv, void *bsp_priv,
 
 	if (rk->supports_rmii)
 		__set_bit(PHY_INTERFACE_MODE_RMII, interfaces);
+
+	if (rk->ops->set_to_sgmii && rk->xpcs)
+		__set_bit(PHY_INTERFACE_MODE_SGMII, interfaces);
 }
 
 static int rk_set_clk_tx_rate(void *bsp_priv_, struct clk *clk_tx_i,
@@ -1498,6 +1705,10 @@ static int rk_set_clk_tx_rate(void *bsp_priv_, struct clk *clk_tx_i,
 	int ret = -EINVAL;
 	bool is_100m;
 	u32 val;
+
+	/* With SGMII the MAC clock comes from the XPCS, not from the CRU */
+	if (interface == PHY_INTERFACE_MODE_SGMII)
+		return 0;
 
 	if (bsp_priv->ops->set_speed) {
 		ret = bsp_priv->ops->set_speed(bsp_priv, interface, speed);
