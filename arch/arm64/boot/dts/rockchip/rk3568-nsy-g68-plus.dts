@@ -720,6 +720,8 @@
 	rtl8367s: switch@29 {
 			compatible = "realtek,rtl8365mb";
 			reg = <29>;
+			/* LED0 (yellow): link/act, LED1 (green): 1000M, LED2: off */
+			realtek,led-functions = <2 3>;
 
 			ports {
 					#address-cells = <1>;
