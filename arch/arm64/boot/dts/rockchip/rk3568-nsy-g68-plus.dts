@@ -555,10 +555,15 @@
 							};
 					};
 
-					/* SerDes to gmac1 through combphy1 */
+					/*
+					 * SerDes to gmac1 through combphy1. The switch
+					 * tags frames towards one CPU port only, so this
+					 * is a plain user port: bridging it with a front
+					 * port forwards that port to gmac1 in hardware.
+					 */
 					port@6 {
 							reg = <6>;
-							ethernet = <&gmac1>;
+							label = "sgmii";
 							phy-mode = "sgmii";
 
 							fixed-link {
