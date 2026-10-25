@@ -674,22 +674,13 @@
 	};
 };
 
+/* Their PHY (usb2phy1) is disabled, so they could never probe */
 &usb_host0_ehci {
-	status = "okay";
+	status = "disabled";
 };
 
 &usb_host0_ohci {
-	status = "okay";
-	snps,dis_enblslpm_quirk;
-	snps,dis-u1-entry-quirk;
-	snps,dis-u2-entry-quirk;
-	snps,dis-u2-freeclk-exists-quirk;
-	snps,dis-del-phy-power-chg-quirk;
-	snps,dis-tx-ipgap-linecheck-quirk;
-	snps,dis_rxdet_inp3_quirk;
-	snps,xhci-trb-ent-quirk;
-	snps,parkmode-disable-ss-quirk;
-	quirk-skip-phy-init;
+	status = "disabled";
 };
 
 &usb_host0_xhci {
