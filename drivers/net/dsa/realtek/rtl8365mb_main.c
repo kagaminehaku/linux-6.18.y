@@ -3547,6 +3547,7 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 	struct realtek_priv *priv = ds->priv;
 	struct rtl8365mb_cpu *cpu;
 	u32 downports_mask = 0;
+	u32 led_ports_mask = 0;
 	u32 upports_mask = 0;
 	struct rtl8365mb *mb;
 	struct dsa_port *dp;
@@ -3676,9 +3677,15 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 		 * downstream DSA ports.
 		 */
 		downports_mask |= BIT(dp->index);
+
+		/* External interface ports (e.g. a SerDes used as a user
+		 * port) have no LED pins
+		 */
+		if (!rtl8365mb_get_port_extint(priv, dp->index))
+			led_ports_mask |= BIT(dp->index);
 	}
 
-	ret = rtl8365mb_led_setup(priv, downports_mask);
+	ret = rtl8365mb_led_setup(priv, led_ports_mask);
 	if (ret)
 		dev_warn(priv->dev, "failed to configure port LEDs: %pe\n",
 			 ERR_PTR(ret));
