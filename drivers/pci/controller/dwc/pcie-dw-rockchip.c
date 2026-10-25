@@ -738,6 +738,14 @@ static int rockchip_pcie_configure_rc(struct platform_device *pdev,
 		return ret;
 	}
 
+	/*
+	 * The status bit latches while masked, so a link-down from before this
+	 * point (e.g. the boot loader handing over a trained link) would fire
+	 * as soon as it is unmasked and send the port into a reset loop.
+	 */
+	rockchip_pcie_writel_apb(rockchip, PCIE_LINK_REQ_RST_NOT_INT,
+				 PCIE_CLIENT_INTR_STATUS_MISC);
+
 	/* unmask hot reset/link-down reset */
 	val = FIELD_PREP_WM16(PCIE_LINK_REQ_RST_NOT_INT, 0);
 	rockchip_pcie_writel_apb(rockchip, val, PCIE_CLIENT_INTR_MASK_MISC);
@@ -936,6 +944,13 @@ static int rockchip_pcie_rc_reset_root_port(struct pci_host_bridge *bridge,
 		dev_err(dev, "Failed to setup RC: %d\n", ret);
 		goto deinit_clk;
 	}
+
+	/*
+	 * Stopping the link above latched a new link-down event, which would
+	 * otherwise trigger another reset once this one returns.
+	 */
+	rockchip_pcie_writel_apb(rockchip, PCIE_LINK_REQ_RST_NOT_INT,
+				 PCIE_CLIENT_INTR_STATUS_MISC);
 
 	/* unmask hot reset/link-down reset */
 	val = FIELD_PREP_WM16(PCIE_LINK_REQ_RST_NOT_INT, 0);
